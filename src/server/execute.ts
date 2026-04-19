@@ -1,18 +1,17 @@
 /**
- * Execute a single Cerebras Inference run.
+ * Execute a Cerebras Inference run.
  *
- * Strategy: direct OpenAI-compatible HTTP call to
- *   POST https://api.cerebras.ai/v1/chat/completions
- * with `Authorization: Bearer $CEREBRAS_API_KEY` and `stream: true`.
+ * v0.7: adds OpenAI-style tool calling. When the execution context
+ * exposes tools (`ctx.tools`), we switch to a non-streaming chat.completions
+ * loop, translating each entry to OpenAI `tools`/`tool_choice`, invoking
+ * any `tool_calls` via `ctx.tools.invoke()`, appending tool_result messages,
+ * and looping until `finish_reason === "stop"` (or `TOOL_CALL_MAX_ITERATIONS`
+ * is reached). When no tools are configured we keep the v0.0.1 streaming
+ * single-turn fast-path untouched — Cerebras is ~1500 tok/sec and the whole
+ * point is to stream those tokens live.
  *
- * Cerebras runs on their own CS-3 wafer-scale silicon and is the fastest
- * LLM inference backend anywhere (~1500 tok/sec on frontier open-weights
- * models like Qwen 3 235B). That speed is the whole point of this
- * adapter — we stream tokens straight through the SSE parser to keep
- * first-byte latency minimal.
- *
- * v0.0.1 is single-turn. Tool calling, session resume, and multi-turn
- * history are left as TODOs below.
+ * Cerebras throttles aggressively on the free tier; 429s mid-loop surface a
+ * short, friendly message rather than a cryptic HTTP error.
  */
 
 import {
@@ -39,6 +38,8 @@ import {
   DEFAULT_PROMPT_TEMPLATE,
   DEFAULT_TIMEOUT_SEC,
   PROVIDER_SLUG,
+  RATE_LIMIT_MESSAGE,
+  TOOL_CALL_MAX_ITERATIONS,
 } from "../shared/constants.js";
 
 interface ResolvedKey {
@@ -59,6 +60,187 @@ function resolveCerebrasApiKey(envConfig: Record<string, unknown>): ResolvedKey 
   return { key: null, source: "missing" };
 }
 
+// ---------------------------------------------------------------------
+// Tool plumbing
+// ---------------------------------------------------------------------
+
+/**
+ * Minimal duck-typed shape the adapter uses to read tools from
+ * `AdapterExecutionContext`. The current `@paperclipai/adapter-utils`
+ * release does not declare `tools` on the context, so we treat it as
+ * optional and check at runtime. This lets v0.7 compile cleanly against
+ * today's SDK and light up tool calling as soon as the host plugin
+ * starts populating `ctx.tools`.
+ */
+interface ToolDescriptor {
+  name: string;
+  description?: string;
+  parameters?: Record<string, unknown>;
+  inputSchema?: Record<string, unknown>;
+}
+interface ToolRegistry {
+  list?: () => ToolDescriptor[] | Promise<ToolDescriptor[]>;
+  invoke: (name: string, args: Record<string, unknown>) => Promise<unknown>;
+}
+
+async function readToolsFromContext(ctx: AdapterExecutionContext): Promise<{
+  registry: ToolRegistry | null;
+  descriptors: ToolDescriptor[];
+}> {
+  const maybe = (ctx as unknown as { tools?: unknown }).tools;
+  if (!maybe || typeof maybe !== "object") return { registry: null, descriptors: [] };
+  const reg = maybe as Partial<ToolRegistry> & {
+    entries?: ToolDescriptor[];
+    available?: ToolDescriptor[];
+  };
+  if (typeof reg.invoke !== "function") return { registry: null, descriptors: [] };
+  let descriptors: ToolDescriptor[] = [];
+  try {
+    if (typeof reg.list === "function") {
+      const listed = await reg.list();
+      if (Array.isArray(listed)) descriptors = listed;
+    } else if (Array.isArray(reg.entries)) {
+      descriptors = reg.entries;
+    } else if (Array.isArray(reg.available)) {
+      descriptors = reg.available;
+    }
+  } catch {
+    descriptors = [];
+  }
+  const valid = descriptors.filter(
+    (t): t is ToolDescriptor => !!t && typeof t.name === "string" && t.name.length > 0,
+  );
+  return { registry: reg as ToolRegistry, descriptors: valid };
+}
+
+function toolDescriptorsToOpenAi(
+  tools: ToolDescriptor[],
+): Array<Record<string, unknown>> {
+  return tools.map((t) => ({
+    type: "function",
+    function: {
+      name: t.name,
+      description: t.description ?? "",
+      parameters: t.parameters ?? t.inputSchema ?? {
+        type: "object",
+        properties: {},
+      },
+    },
+  }));
+}
+
+// ---------------------------------------------------------------------
+// Non-streaming chat.completions call used by the tool-calling loop.
+// ---------------------------------------------------------------------
+
+interface ChatMessage {
+  role: "system" | "user" | "assistant" | "tool";
+  content: string | null;
+  name?: string;
+  tool_call_id?: string;
+  tool_calls?: Array<{
+    id: string;
+    type: "function";
+    function: { name: string; arguments: string };
+  }>;
+}
+
+interface OpenAiChoice {
+  index: number;
+  finish_reason: string | null;
+  message: {
+    role: "assistant";
+    content: string | null;
+    tool_calls?: Array<{
+      id: string;
+      type: "function";
+      function: { name: string; arguments: string };
+    }>;
+  };
+}
+
+interface OpenAiNonStreamingResponse {
+  id?: string;
+  model?: string;
+  choices?: OpenAiChoice[];
+  usage?: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    total_tokens?: number;
+  };
+}
+
+interface ChatCallOutcome {
+  ok: boolean;
+  status: number;
+  statusText: string;
+  body: OpenAiNonStreamingResponse | null;
+  rawError: string | null;
+}
+
+async function callChatCompletionsJson(
+  apiKey: string,
+  body: Record<string, unknown>,
+  signal: AbortSignal,
+): Promise<ChatCallOutcome> {
+  const resp = await fetch(CEREBRAS_CHAT_COMPLETIONS_URL, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      accept: "application/json",
+      authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify(body),
+    signal,
+  });
+  if (!resp.ok) {
+    const rawText = await resp.text().catch(() => "");
+    let parsed: unknown = null;
+    try {
+      parsed = JSON.parse(rawText);
+    } catch {
+      parsed = null;
+    }
+    return {
+      ok: false,
+      status: resp.status,
+      statusText: resp.statusText,
+      body: null,
+      rawError: describeOpenAiError(parsed) ?? rawText.slice(0, 500),
+    };
+  }
+  const parsedBody = (await resp.json().catch(() => null)) as OpenAiNonStreamingResponse | null;
+  return {
+    ok: true,
+    status: resp.status,
+    statusText: resp.statusText,
+    body: parsedBody,
+    rawError: null,
+  };
+}
+
+function safeParseJsonArgs(raw: string): Record<string, unknown> {
+  if (!raw) return {};
+  try {
+    const v = JSON.parse(raw);
+    if (v && typeof v === "object" && !Array.isArray(v)) {
+      return v as Record<string, unknown>;
+    }
+    return {};
+  } catch {
+    return {};
+  }
+}
+
+function stringifyToolResult(v: unknown): string {
+  if (typeof v === "string") return v;
+  try {
+    return JSON.stringify(v);
+  } catch {
+    return String(v);
+  }
+}
+
 export async function execute(
   ctx: AdapterExecutionContext,
 ): Promise<AdapterExecutionResult> {
@@ -74,11 +256,7 @@ export async function execute(
   const envConfig = parseObject(config.env);
   const { key: apiKey, source: apiKeySource } = resolveCerebrasApiKey(envConfig);
 
-  // ------------------------------------------------------------------
-  // Prompt assembly — mirror the (minimal) subset of claude_local that
-  // makes sense for a single-turn HTTP call: render the configured
-  // template, then join any wake / handoff prelude the server injected.
-  // ------------------------------------------------------------------
+  // Prompt assembly
   const templateData = {
     agentId: agent.id,
     companyId: agent.companyId,
@@ -92,18 +270,25 @@ export async function execute(
   const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
   const userPrompt = joinPromptSections([sessionHandoffNote, renderedPrompt]).trim();
 
-  // ------------------------------------------------------------------
-  // Invocation meta — nothing is spawned as a child, but we still want
-  // Paperclip to log what HTTP call it is about to make.
-  // ------------------------------------------------------------------
+  // Tools discovery — duck-typed; absent on SDKs that don't expose ctx.tools.
+  const { registry: toolsRegistry, descriptors: toolDescriptors } =
+    await readToolsFromContext(ctx);
+  const toolCallingEnabled = !!toolsRegistry && toolDescriptors.length > 0;
+
   if (onMeta) {
     await onMeta({
       adapterType: ADAPTER_TYPE,
       command: `POST ${CEREBRAS_CHAT_COMPLETIONS_URL}`,
       cwd: process.cwd(),
-      commandArgs: [model, `timeout=${timeoutSec}s`],
+      commandArgs: [
+        model,
+        `timeout=${timeoutSec}s`,
+        toolCallingEnabled
+          ? `tools=${toolDescriptors.length}`
+          : "tools=0",
+      ],
       commandNotes: [
-        `Cerebras Inference — ~1500 tok/sec streaming`,
+        `Cerebras Inference — ~1500 tok/sec${toolCallingEnabled ? " (tool-calling loop)" : " streaming"}`,
         `API key source: ${apiKeySource}`,
       ],
       env: {
@@ -134,9 +319,49 @@ export async function execute(
     };
   }
 
-  // ------------------------------------------------------------------
-  // Build request. Cerebras follows the OpenAI chat-completions schema.
-  // ------------------------------------------------------------------
+  if (toolCallingEnabled && toolsRegistry) {
+    return await executeToolCallingLoop({
+      apiKey,
+      model,
+      systemPrompt,
+      userPrompt,
+      temperature,
+      maxTokensCfg,
+      timeoutSec,
+      toolDescriptors,
+      toolsRegistry,
+      onLog,
+    });
+  }
+
+  return await executeStreaming({
+    apiKey,
+    model,
+    systemPrompt,
+    userPrompt,
+    temperature,
+    maxTokensCfg,
+    timeoutSec,
+    onLog,
+  });
+}
+
+// ---------------------------------------------------------------------
+// Streaming single-turn (v0.0.1 fast-path, preserved verbatim).
+// ---------------------------------------------------------------------
+
+async function executeStreaming(args: {
+  apiKey: string;
+  model: string;
+  systemPrompt: string;
+  userPrompt: string;
+  temperature: number;
+  maxTokensCfg: number;
+  timeoutSec: number;
+  onLog: AdapterExecutionContext["onLog"];
+}): Promise<AdapterExecutionResult> {
+  const { apiKey, model, systemPrompt, userPrompt, temperature, maxTokensCfg, timeoutSec, onLog } = args;
+
   const messages: Array<{ role: "system" | "user"; content: string }> = [];
   if (systemPrompt) messages.push({ role: "system", content: systemPrompt });
   messages.push({ role: "user", content: userPrompt });
@@ -145,8 +370,6 @@ export async function execute(
     model,
     messages,
     stream: true,
-    // Ask Cerebras to include a final usage frame — this is optional in
-    // the OpenAI spec, opt-in on most providers.
     stream_options: { include_usage: true },
     temperature,
   };
@@ -188,18 +411,14 @@ export async function execute(
     };
   }
 
-  // Non-2xx: read the body (JSON, not SSE) and surface the provider's error.
   if (!resp.ok) {
     clearTimeout(timeoutHandle);
     const rawText = await resp.text().catch(() => "");
     let parsedErr: unknown = null;
-    try {
-      parsedErr = JSON.parse(rawText);
-    } catch {
-      parsedErr = null;
-    }
+    try { parsedErr = JSON.parse(rawText); } catch { parsedErr = null; }
     const providerMsg = describeOpenAiError(parsedErr) ?? rawText.slice(0, 500);
-    const msg = `Cerebras HTTP ${resp.status}: ${providerMsg || resp.statusText}`;
+    const baseMsg = `Cerebras HTTP ${resp.status}: ${providerMsg || resp.statusText}`;
+    const msg = resp.status === 429 ? `${baseMsg} — ${RATE_LIMIT_MESSAGE}` : baseMsg;
     await onLog("stderr", `[paperclip-cerebras] ${msg}\n`);
 
     let errorCode: string = "cerebras_http_error";
@@ -220,11 +439,6 @@ export async function execute(
     };
   }
 
-  // ------------------------------------------------------------------
-  // Stream and accumulate. Cerebras is blisteringly fast, so chunks
-  // tend to arrive in big bursts — we stream each decoded chunk to the
-  // log so callers can watch tokens land in real time.
-  // ------------------------------------------------------------------
   const reader = resp.body?.getReader();
   if (!reader) {
     clearTimeout(timeoutHandle);
@@ -252,8 +466,6 @@ export async function execute(
       if (done) break;
       const chunk = decoder.decode(value, { stream: true });
       buffer += chunk;
-      // Mirror stream chunks straight to the log so operators see
-      // the ~1500 tok/sec throughput live.
       await onLog("stdout", chunk);
     }
     buffer += decoder.decode();
@@ -302,8 +514,6 @@ export async function execute(
     biller: BILLER_SLUG,
     model: parsed.model ?? model,
     billingType: "credits",
-    // Free tier — cost is zero. TODO(Dev Team): once paid tier lands,
-    // compute costUsd from Cerebras's per-model rate card.
     costUsd: 0,
     resultJson: {
       text: parsed.text,
@@ -315,13 +525,240 @@ export async function execute(
   };
 }
 
+// ---------------------------------------------------------------------
+// Tool-calling loop (non-streaming; up to TOOL_CALL_MAX_ITERATIONS turns).
+// ---------------------------------------------------------------------
+
+async function executeToolCallingLoop(args: {
+  apiKey: string;
+  model: string;
+  systemPrompt: string;
+  userPrompt: string;
+  temperature: number;
+  maxTokensCfg: number;
+  timeoutSec: number;
+  toolDescriptors: ToolDescriptor[];
+  toolsRegistry: ToolRegistry;
+  onLog: AdapterExecutionContext["onLog"];
+}): Promise<AdapterExecutionResult> {
+  const {
+    apiKey, model, systemPrompt, userPrompt, temperature, maxTokensCfg,
+    timeoutSec, toolDescriptors, toolsRegistry, onLog,
+  } = args;
+
+  const openAiTools = toolDescriptorsToOpenAi(toolDescriptors);
+  const messages: ChatMessage[] = [];
+  if (systemPrompt) messages.push({ role: "system", content: systemPrompt });
+  messages.push({ role: "user", content: userPrompt });
+
+  const abort = new AbortController();
+  const timeoutHandle = setTimeout(() => abort.abort(), timeoutSec * 1000);
+
+  let totalInputTokens = 0;
+  let totalOutputTokens = 0;
+  let lastCompletionId: string | null = null;
+  let lastModel: string | null = null;
+  let lastFinishReason: string | null = null;
+  let finalText = "";
+
+  try {
+    for (let iter = 0; iter < TOOL_CALL_MAX_ITERATIONS; iter++) {
+      const reqBody: Record<string, unknown> = {
+        model,
+        messages,
+        temperature,
+        stream: false,
+        tools: openAiTools,
+        tool_choice: "auto",
+      };
+      if (maxTokensCfg > 0) reqBody.max_tokens = maxTokensCfg;
+
+      let outcome: ChatCallOutcome;
+      try {
+        outcome = await callChatCompletionsJson(apiKey, reqBody, abort.signal);
+      } catch (err) {
+        const timedOut = (err as { name?: string })?.name === "AbortError";
+        const reason = err instanceof Error ? err.message : String(err);
+        const msg = timedOut
+          ? `Timed out after ${timeoutSec}s`
+          : `Cerebras request failed: ${reason}`;
+        await onLog("stderr", `[paperclip-cerebras] ${msg}\n`);
+        return {
+          exitCode: timedOut ? 124 : 1,
+          signal: null,
+          timedOut,
+          errorMessage: msg,
+          errorCode: timedOut ? "timeout" : "cerebras_request_failed",
+          provider: PROVIDER_SLUG,
+          biller: BILLER_SLUG,
+          model,
+          billingType: "credits",
+          usage: { inputTokens: totalInputTokens, outputTokens: totalOutputTokens },
+          summary: finalText,
+        };
+      }
+
+      if (!outcome.ok) {
+        const baseMsg = `Cerebras HTTP ${outcome.status}: ${outcome.rawError || outcome.statusText}`;
+        const msg = outcome.status === 429
+          ? `${baseMsg} — ${RATE_LIMIT_MESSAGE}`
+          : baseMsg;
+        await onLog("stderr", `[paperclip-cerebras] ${msg}\n`);
+        let errorCode: string = "cerebras_http_error";
+        if (outcome.status === 401 || outcome.status === 403) errorCode = "cerebras_auth_required";
+        else if (outcome.status === 429) errorCode = "cerebras_rate_limited";
+        else if (outcome.status >= 500) errorCode = "cerebras_upstream_error";
+        return {
+          exitCode: 1,
+          signal: null,
+          timedOut: false,
+          errorMessage: msg,
+          errorCode,
+          provider: PROVIDER_SLUG,
+          biller: BILLER_SLUG,
+          model,
+          billingType: "credits",
+          usage: { inputTokens: totalInputTokens, outputTokens: totalOutputTokens },
+          summary: finalText,
+        };
+      }
+
+      const body = outcome.body;
+      if (!body || !Array.isArray(body.choices) || body.choices.length === 0) {
+        await onLog("stderr", `[paperclip-cerebras] Empty chat.completions response on iteration ${iter}\n`);
+        return {
+          exitCode: 1,
+          signal: null,
+          timedOut: false,
+          errorMessage: "Cerebras returned an empty chat.completions response",
+          errorCode: "cerebras_empty_response",
+          provider: PROVIDER_SLUG,
+          biller: BILLER_SLUG,
+          model,
+          billingType: "credits",
+          usage: { inputTokens: totalInputTokens, outputTokens: totalOutputTokens },
+          summary: finalText,
+        };
+      }
+
+      if (typeof body.id === "string") lastCompletionId = body.id;
+      if (typeof body.model === "string") lastModel = body.model;
+      if (body.usage) {
+        if (typeof body.usage.prompt_tokens === "number") totalInputTokens += body.usage.prompt_tokens;
+        if (typeof body.usage.completion_tokens === "number") totalOutputTokens += body.usage.completion_tokens;
+      }
+
+      const choice = body.choices[0];
+      lastFinishReason = choice.finish_reason;
+      const assistantMsg = choice.message;
+      const toolCalls = assistantMsg.tool_calls ?? [];
+      const assistantContent = assistantMsg.content ?? "";
+
+      // Mirror assistant text to the log so operators see progress.
+      if (assistantContent) {
+        await onLog("stdout", assistantContent);
+      }
+
+      // Push the assistant turn into history verbatim.
+      messages.push({
+        role: "assistant",
+        content: assistantContent || null,
+        ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
+      });
+
+      if (choice.finish_reason === "tool_calls" && toolCalls.length > 0) {
+        for (const tc of toolCalls) {
+          const toolName = tc.function?.name ?? "";
+          const rawArgs = tc.function?.arguments ?? "";
+          const parsedArgs = safeParseJsonArgs(rawArgs);
+          await onLog(
+            "stdout",
+            `\n[paperclip-cerebras] tool_call ${toolName}(${rawArgs.slice(0, 200)})\n`,
+          );
+          let resultText: string;
+          try {
+            const result = await toolsRegistry.invoke(toolName, parsedArgs);
+            resultText = stringifyToolResult(result);
+          } catch (err) {
+            const reason = err instanceof Error ? err.message : String(err);
+            resultText = JSON.stringify({ error: reason });
+            await onLog(
+              "stderr",
+              `[paperclip-cerebras] tool ${toolName} failed: ${reason}\n`,
+            );
+          }
+          messages.push({
+            role: "tool",
+            tool_call_id: tc.id,
+            content: resultText,
+          });
+        }
+        // Continue loop for follow-up assistant turn.
+        continue;
+      }
+
+      // finish_reason === "stop" (or length/content_filter/etc.) — we're done.
+      finalText = assistantContent;
+      break;
+    }
+
+    if (lastFinishReason === "tool_calls") {
+      // Hit the iteration cap.
+      await onLog(
+        "stderr",
+        `[paperclip-cerebras] tool-call loop hit max iterations (${TOOL_CALL_MAX_ITERATIONS})\n`,
+      );
+      return {
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        errorMessage: `Tool-call loop exceeded ${TOOL_CALL_MAX_ITERATIONS} iterations without a final answer.`,
+        errorCode: "cerebras_tool_loop_exhausted",
+        provider: PROVIDER_SLUG,
+        biller: BILLER_SLUG,
+        model: lastModel ?? model,
+        billingType: "credits",
+        usage: { inputTokens: totalInputTokens, outputTokens: totalOutputTokens },
+        sessionId: lastCompletionId,
+        sessionParams: lastCompletionId ? { sessionId: lastCompletionId } : null,
+        sessionDisplayId: lastCompletionId,
+        summary: finalText,
+      };
+    }
+  } finally {
+    clearTimeout(timeoutHandle);
+  }
+
+  return {
+    exitCode: 0,
+    signal: null,
+    timedOut: false,
+    errorMessage: null,
+    usage: {
+      inputTokens: totalInputTokens,
+      outputTokens: totalOutputTokens,
+    },
+    sessionId: lastCompletionId,
+    sessionParams: lastCompletionId ? { sessionId: lastCompletionId } : null,
+    sessionDisplayId: lastCompletionId,
+    provider: PROVIDER_SLUG,
+    biller: BILLER_SLUG,
+    model: lastModel ?? model,
+    billingType: "credits",
+    costUsd: 0,
+    resultJson: {
+      text: finalText,
+      finishReason: lastFinishReason,
+      completionId: lastCompletionId,
+      model: lastModel,
+    },
+    summary: finalText,
+  };
+}
+
 // TODO(Dev Team):
-// 1. Tool calling — translate Paperclip's tool protocol to OpenAI
-//    `tools` + `tool_choice`, parse `tool_calls` deltas from the stream,
-//    and loop until `finish_reason === "stop"`.
-// 2. Session resume — persist conversation history and replay on
-//    subsequent runs. Cerebras has no server-side session concept, so
-//    this is pure client-side bookkeeping.
-// 3. Cost tracking — currently hard-coded to 0 (free tier only).
-// 4. Retry/backoff on 429 (rate-limit) and 5xx.
-// 5. testEnvironment() — ping `/v1/models` and surface auth/network checks.
+// 1. Session resume — persist multi-turn history across runs (pure
+//    client-side bookkeeping; Cerebras has no server-side session concept).
+// 2. Cost tracking — hard-coded to 0. Compute per-model costUsd from
+//    Cerebras's paid rate card once billing is enabled.
+// 3. Retry/backoff on transient 429 / 5xx inside the tool-call loop.

@@ -3,16 +3,13 @@
  *
  * Cerebras runs LLMs on its own CS-3 wafer-scale silicon and is the
  * fastest inference backend in the world — typical throughput is
- * ~1500 tokens/second on frontier open-weights models. That raw speed
- * is the whole reason this adapter exists: when latency matters more
- * than model choice, point a Paperclip agent here and watch it rip.
+ * ~1500 tokens/second on frontier open-weights models.
  *
- * Strategy: direct OpenAI-compatible HTTP calls to
- *   https://api.cerebras.ai/v1/chat/completions
- * using `Authorization: Bearer $CEREBRAS_API_KEY`.
- *
- * v0.0.1 is single-turn; see TODOs in `server/execute.ts` for
- * tool-calling, session resume, and retry/backoff work items.
+ * v0.7:
+ *   - OpenAI-style tool calling (see `server/execute.ts`).
+ *   - Full model catalog: queries `/v1/models` at boot and sorts
+ *     free-tier models before pro/paid ones. Falls back to the hardcoded
+ *     constants list when the API is unreachable.
  *
  * @packageDocumentation
  */
@@ -29,10 +26,12 @@ import {
   ADAPTER_TYPE,
   AUTH_ENV_VAR,
   CEREBRAS_MODELS_URL,
+  CONTEXT_WINDOWS,
   DEFAULT_MODEL,
   DEFAULT_PROMPT_TEMPLATE,
   DEFAULT_TIMEOUT_SEC,
   FREE_MODELS,
+  PAID_MODELS,
 } from "./shared/constants.js";
 import {
   detectModel,
@@ -44,18 +43,57 @@ export const type = ADAPTER_TYPE;
 export const label = ADAPTER_LABEL;
 
 /**
- * Static fallback model list. Cerebras only ships one model on the
- * free tier right now, but we keep this in an array so paid-tier
- * models can be dropped in without touching the factory.
+ * Extended AdapterModel with tier + context-window metadata. Paperclip's
+ * AdapterModel type only requires { id, label }, but we tag each entry with
+ * the extra fields so downstream tools (pricing, config UIs, etc.) can key
+ * on them without a second lookup.
  */
-const STATIC_FALLBACK: AdapterModel[] = FREE_MODELS.map((id) => ({
-  id,
-  label: `${id} — free (Cerebras ~1500 tok/sec)`,
-}));
+interface CerebrasModelMeta extends AdapterModel {
+  free: boolean;
+  contextWindow: number;
+}
 
-async function loadModels(): Promise<AdapterModel[]> {
+const FREE_SET = new Set<string>(FREE_MODELS);
+
+function isFreeModel(id: string): boolean {
+  return FREE_SET.has(id);
+}
+
+function contextWindowFor(id: string): number {
+  return CONTEXT_WINDOWS[id] ?? 8192;
+}
+
+function labelFor(id: string, free: boolean, ctx: number): string {
+  const tier = free ? "free" : "pro";
+  const ctxLabel = ctx >= 1000 ? `${Math.round(ctx / 1024)}K` : String(ctx);
+  return `${id} — ${tier} · ${ctxLabel} ctx (Cerebras ~1500 tok/sec)`;
+}
+
+function toModelMeta(id: string): CerebrasModelMeta {
+  const free = isFreeModel(id);
+  const ctx = contextWindowFor(id);
+  return { id, label: labelFor(id, free, ctx), free, contextWindow: ctx };
+}
+
+/**
+ * Hardcoded fallback — used when `/v1/models` is unreachable (offline or
+ * missing API key). Free models come first, paid/pro second.
+ */
+const STATIC_FALLBACK: CerebrasModelMeta[] = [
+  ...FREE_MODELS.map((id) => toModelMeta(id)),
+  ...PAID_MODELS.map((id) => toModelMeta(id)),
+];
+
+function sortModels(models: CerebrasModelMeta[]): CerebrasModelMeta[] {
+  return [...models].sort((a, b) => {
+    if (a.free !== b.free) return a.free ? -1 : 1;
+    return a.id.localeCompare(b.id);
+  });
+}
+
+async function loadModels(): Promise<CerebrasModelMeta[]> {
   const apiKey = (process.env[AUTH_ENV_VAR] ?? "").trim();
-  if (!apiKey) return STATIC_FALLBACK;
+  if (!apiKey) return sortModels(STATIC_FALLBACK);
   try {
     const resp = await fetch(CEREBRAS_MODELS_URL, {
       headers: {
@@ -64,20 +102,22 @@ async function loadModels(): Promise<AdapterModel[]> {
       },
       signal: AbortSignal.timeout(10_000),
     });
-    if (!resp.ok) return STATIC_FALLBACK;
-    const body = (await resp.json()) as { data?: Array<{ id?: string }> };
-    if (!body || !Array.isArray(body.data)) return STATIC_FALLBACK;
-    const out: AdapterModel[] = [];
+    if (!resp.ok) return sortModels(STATIC_FALLBACK);
+    const body = (await resp.json()) as { data?: Array<{ id?: string; context_length?: number }> };
+    if (!body || !Array.isArray(body.data)) return sortModels(STATIC_FALLBACK);
+    const out: CerebrasModelMeta[] = [];
     for (const m of body.data) {
       if (!m || typeof m.id !== "string" || !m.id) continue;
-      out.push({
-        id: m.id,
-        label: `${m.id} — Cerebras (~1500 tok/sec)`,
-      });
+      const free = isFreeModel(m.id);
+      const ctx =
+        typeof m.context_length === "number" && m.context_length > 0
+          ? m.context_length
+          : contextWindowFor(m.id);
+      out.push({ id: m.id, label: labelFor(m.id, free, ctx), free, contextWindow: ctx });
     }
-    return out.length > 0 ? out : STATIC_FALLBACK;
+    return out.length > 0 ? sortModels(out) : sortModels(STATIC_FALLBACK);
   } catch {
-    return STATIC_FALLBACK;
+    return sortModels(STATIC_FALLBACK);
   }
 }
 
@@ -85,7 +125,7 @@ export const models: AdapterModel[] = await loadModels();
 
 export const agentConfigurationDoc = `# Cerebras Inference Adapter
 
-This adapter routes an agent's single-turn requests to
+This adapter routes Paperclip agents to
 [Cerebras Inference](https://cerebras.ai/inference), the fastest LLM
 inference backend in the world (~1500 tokens/second on frontier
 open-weights models running on their CS-3 wafer-scale silicon).
@@ -98,7 +138,7 @@ open-weights models running on their CS-3 wafer-scale silicon).
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| model | string | \`${DEFAULT_MODEL}\` | Cerebras model id. Free tier currently: \`${DEFAULT_MODEL}\`. |
+| model | string | \`${DEFAULT_MODEL}\` | Cerebras model id. Free tier default: \`${DEFAULT_MODEL}\`. |
 | temperature | number | 0.7 | Sampling temperature. |
 | maxTokens | number | _(unset)_ | Max completion tokens. 0 = provider default. |
 | systemPrompt | string | _(none)_ | Optional system prompt prepended to the conversation. |
@@ -110,11 +150,21 @@ open-weights models running on their CS-3 wafer-scale silicon).
 
 - \`${AUTH_ENV_VAR}\` — required. Read from \`config.env.${AUTH_ENV_VAR}\` first, then \`process.env.${AUTH_ENV_VAR}\`.
 
-## Notes / Limitations
+## Features
 
-- **v0.0.1 is single-turn.** Tool calling and session resume are TODO.
-- Billing is reported as \`provider=cerebras, biller=cerebras,
-  billingType=credits\`. On the free tier \`costUsd=0\`.
+- **Streaming single-turn** (no tools): SSE chunks are mirrored straight
+  to the log for live ~1500 tok/sec throughput.
+- **Tool calling** (when \`ctx.tools\` is populated): OpenAI-style loop,
+  up to 10 iterations. Each \`tool_call\` is invoked via the adapter
+  context; \`tool\` messages are appended and the conversation continues
+  until \`finish_reason === "stop"\`.
+- **Rate-limit handling**: HTTP 429 surfaces a friendly message
+  prompting the caller to back off or upgrade to the pro tier.
+
+## Notes
+
+- Billing is reported as \`provider=cerebras, biller=cerebras, billingType=credits\`.
+- Free tier \`costUsd=0\`. Paid rate-card integration is TODO.
 `;
 
 const configSchema: AdapterConfigSchema = {
@@ -126,7 +176,7 @@ const configSchema: AdapterConfigSchema = {
       default: DEFAULT_MODEL,
       required: false,
       options: STATIC_FALLBACK.map((m) => ({ label: m.label, value: m.id })),
-      hint: "Cerebras model id. Free tier is limited to qwen-3-235b-a22b-instruct-2507.",
+      hint: "Cerebras model id. Free tier currently: qwen-3-235b-a22b-instruct-2507.",
     },
     {
       key: "temperature",
@@ -167,11 +217,6 @@ const configSchema: AdapterConfigSchema = {
   ],
 };
 
-/**
- * Minimal testEnvironment — we don't spawn anything, so the only
- * meaningful check is "is CEREBRAS_API_KEY present?" plus a cheap
- * ping of `/v1/models`.
- */
 async function testEnvironment(
   ctx: AdapterEnvironmentTestContext,
 ): Promise<AdapterEnvironmentTestResult> {
@@ -233,9 +278,6 @@ async function testEnvironment(
   }
 }
 
-/**
- * Factory invoked by the Paperclip plugin loader.
- */
 export function createServerAdapter(): ServerAdapterModule {
   return {
     type: ADAPTER_TYPE,

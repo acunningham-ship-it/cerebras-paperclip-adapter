@@ -1,6 +1,6 @@
 {
   "name": "cerebras-paperclip-adapter",
-  "version": "0.0.1",
+  "version": "0.7.0",
   "description": "Paperclip adapter for Cerebras Inference. Globally fastest LLM inference.",
   "type": "module",
   "license": "MIT",
